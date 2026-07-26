@@ -1,24 +1,31 @@
 blueprint:
   name: "Solar Priority Switch Manager (Deye/Solarman + Solcast) - Zéro Injection"
   description: >
+    **Version: 1.1**
+
+
     Pilote jusqu'à 4 switches par ordre de priorité (1 = prioritaire, 4 = dernier)
     en fonction du surplus solaire réel (Solarman/Deye) recoupé avec la prévision
-    Solcast, du SOC batterie et de la présence du Grid.
+    Solcast, du SOC batterie et de la présence du Grid. Seul le Device 1 est
+    obligatoire ; les Devices 2 à 4 sont optionnels (laisser le champ "Switch"
+    vide pour désactiver un device).
 
     Hypothèses retenues (à ajuster si besoin) :
     - Un device avec "Temps minimal d'exécution" = 0 est considéré comme
       autogéré : le blueprint l'allume mais ne l'éteint JAMAIS automatiquement,
       sauf en cas de perte du Grid (sécurité, bypass systématique).
-    - "Battery Capacity" et "Grid Voltage" sont collectés mais purement
-      informatifs dans cette version (non utilisés pour les décisions).
     - Condition d'extinction 2.d (rapprochement de la prévision Solcast) est
       ignorée si la production du jour dépasse déjà la prévision Solcast du
       jour (cas où Solcast a sous-estimé la production) : dans ce cas on se
-      base uniquement sur 2.a / 2.b / 2.c.
-    - Les conditions d'extinction 2.a, 2.b, 2.d sont globales (s'appliquent à
-      tout device allumé dont le temps minimal est écoulé). La condition 2.c
+      base uniquement sur 2.a / 2.b / 2.c / 2.e.
+    - Les conditions d'extinction 2.a, 2.b, 2.d, 2.e sont globales (s'appliquent
+      à tout device allumé dont le temps minimal est écoulé). La condition 2.c
       est évaluée individuellement par device (sa propre consommation vs 10%
       -par défaut- de la puissance de décharge batterie).
+    - Le CT1 (External CT1 Power) sert de garde-fou de sûreté : il bloque le
+      démarrage d'un device en cas d'import réseau déjà présent (2.e au
+      démarrage) et déclenche l'extinction globale en cas d'import significatif
+      (2.e à l'extinction), indépendamment de l'état de la batterie.
     - Un seul device est démarré par cycle d'évaluation (pour laisser le
       Load power se stabiliser avant de réévaluer le surplus disponible),
       mais plusieurs devices peuvent être arrêtés dans le même cycle.
@@ -195,11 +202,12 @@ blueprint:
               unit_of_measurement: "min"
 
     device_2_group:
-      name: "Device 2 (priorité 2)"
+      name: "Device 2 (priorité 2) - optionnel"
       icon: mdi:numeric-2-circle
       input:
         device_2_switch:
-          name: "Switch"
+          name: "Switch (laisser vide pour désactiver ce device)"
+          default: ""
           selector:
             entity:
               domain: switch
@@ -229,11 +237,12 @@ blueprint:
               unit_of_measurement: "min"
 
     device_3_group:
-      name: "Device 3 (priorité 3)"
+      name: "Device 3 (priorité 3) - optionnel"
       icon: mdi:numeric-3-circle
       input:
         device_3_switch:
-          name: "Switch"
+          name: "Switch (laisser vide pour désactiver ce device)"
+          default: ""
           selector:
             entity:
               domain: switch
@@ -263,11 +272,12 @@ blueprint:
               unit_of_measurement: "min"
 
     device_4_group:
-      name: "Device 4 (priorité 4 - la plus basse)"
+      name: "Device 4 (priorité 4 - la plus basse) - optionnel"
       icon: mdi:numeric-4-circle
       input:
         device_4_switch:
-          name: "Switch"
+          name: "Switch (laisser vide pour désactiver ce device)"
+          default: ""
           selector:
             entity:
               domain: switch
@@ -420,7 +430,8 @@ action:
            and surplus_power >= device_1_power
            and grid_ct_power <= grid_import_stop_threshold_w }}
 
-      # --- device 2 ---
+      # --- device 2 (optionnel) ---
+      device_2_configured: "{{ device_2_switch not in [none, ''] }}"
       device_2_power_estimate: >-
         {% if device_2_power_sensor and states(device_2_power_sensor) not in ['unknown','unavailable',none] %}
           {{ states(device_2_power_sensor) | float(device_2_power) }}
@@ -435,15 +446,16 @@ action:
       device_2_battery_share_exceeded: >-
         {{ (battery_power > 0) and (device_2_power_estimate >= (battery_power * (battery_discharge_share_threshold / 100))) }}
       device_2_should_stop: >-
-        {{ (not grid_ok) or (not device_2_self_managed and device_2_min_runtime_elapsed
-           and (global_stop_condition or device_2_battery_share_exceeded)) }}
+        {{ device_2_configured and ((not grid_ok) or (not device_2_self_managed and device_2_min_runtime_elapsed
+           and (global_stop_condition or device_2_battery_share_exceeded))) }}
       device_2_can_start: >-
-        {{ states(device_2_switch) == 'off' and grid_ok
+        {{ device_2_configured and states(device_2_switch) == 'off' and grid_ok
            and battery_soc >= soc_start_threshold
            and surplus_power >= device_2_power
            and grid_ct_power <= grid_import_stop_threshold_w }}
 
-      # --- device 3 ---
+      # --- device 3 (optionnel) ---
+      device_3_configured: "{{ device_3_switch not in [none, ''] }}"
       device_3_power_estimate: >-
         {% if device_3_power_sensor and states(device_3_power_sensor) not in ['unknown','unavailable',none] %}
           {{ states(device_3_power_sensor) | float(device_3_power) }}
@@ -458,15 +470,16 @@ action:
       device_3_battery_share_exceeded: >-
         {{ (battery_power > 0) and (device_3_power_estimate >= (battery_power * (battery_discharge_share_threshold / 100))) }}
       device_3_should_stop: >-
-        {{ (not grid_ok) or (not device_3_self_managed and device_3_min_runtime_elapsed
-           and (global_stop_condition or device_3_battery_share_exceeded)) }}
+        {{ device_3_configured and ((not grid_ok) or (not device_3_self_managed and device_3_min_runtime_elapsed
+           and (global_stop_condition or device_3_battery_share_exceeded))) }}
       device_3_can_start: >-
-        {{ states(device_3_switch) == 'off' and grid_ok
+        {{ device_3_configured and states(device_3_switch) == 'off' and grid_ok
            and battery_soc >= soc_start_threshold
            and surplus_power >= device_3_power
            and grid_ct_power <= grid_import_stop_threshold_w }}
 
-      # --- device 4 ---
+      # --- device 4 (optionnel) ---
+      device_4_configured: "{{ device_4_switch not in [none, ''] }}"
       device_4_power_estimate: >-
         {% if device_4_power_sensor and states(device_4_power_sensor) not in ['unknown','unavailable',none] %}
           {{ states(device_4_power_sensor) | float(device_4_power) }}
@@ -481,10 +494,10 @@ action:
       device_4_battery_share_exceeded: >-
         {{ (battery_power > 0) and (device_4_power_estimate >= (battery_power * (battery_discharge_share_threshold / 100))) }}
       device_4_should_stop: >-
-        {{ (not grid_ok) or (not device_4_self_managed and device_4_min_runtime_elapsed
-           and (global_stop_condition or device_4_battery_share_exceeded)) }}
+        {{ device_4_configured and ((not grid_ok) or (not device_4_self_managed and device_4_min_runtime_elapsed
+           and (global_stop_condition or device_4_battery_share_exceeded))) }}
       device_4_can_start: >-
-        {{ states(device_4_switch) == 'off' and grid_ok
+        {{ device_4_configured and states(device_4_switch) == 'off' and grid_ok
            and battery_soc >= soc_start_threshold
            and surplus_power >= device_4_power
            and grid_ct_power <= grid_import_stop_threshold_w }}
