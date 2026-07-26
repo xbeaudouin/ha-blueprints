@@ -1,0 +1,555 @@
+blueprint:
+  name: "Solar Priority Switch Manager (Deye/Solarman + Solcast) - Zéro Injection"
+  description: >
+    Pilote jusqu'à 4 switches par ordre de priorité (1 = prioritaire, 4 = dernier)
+    en fonction du surplus solaire réel (Solarman/Deye) recoupé avec la prévision
+    Solcast, du SOC batterie et de la présence du Grid.
+
+    Hypothèses retenues (à ajuster si besoin) :
+    - Un device avec "Temps minimal d'exécution" = 0 est considéré comme
+      autogéré : le blueprint l'allume mais ne l'éteint JAMAIS automatiquement,
+      sauf en cas de perte du Grid (sécurité, bypass systématique).
+    - "Battery Capacity" et "Grid Voltage" sont collectés mais purement
+      informatifs dans cette version (non utilisés pour les décisions).
+    - Condition d'extinction 2.d (rapprochement de la prévision Solcast) est
+      ignorée si la production du jour dépasse déjà la prévision Solcast du
+      jour (cas où Solcast a sous-estimé la production) : dans ce cas on se
+      base uniquement sur 2.a / 2.b / 2.c.
+    - Les conditions d'extinction 2.a, 2.b, 2.d sont globales (s'appliquent à
+      tout device allumé dont le temps minimal est écoulé). La condition 2.c
+      est évaluée individuellement par device (sa propre consommation vs 10%
+      -par défaut- de la puissance de décharge batterie).
+    - Un seul device est démarré par cycle d'évaluation (pour laisser le
+      Load power se stabiliser avant de réévaluer le surplus disponible),
+      mais plusieurs devices peuvent être arrêtés dans le même cycle.
+  domain: automation
+  author: "Xavier Beaudouin"
+  homeassistant:
+    min_version: "2024.6.0"
+
+  input:
+    inverter_group:
+      name: "Inverter / Batterie (Solarman - Deye)"
+      icon: mdi:battery-charging-high
+      input:
+        battery_soc_entity:
+          name: "Batterie SOC (%)"
+          selector:
+            entity:
+              domain: sensor
+        battery_power_entity:
+          name: "Batterie Power (W)"
+          description: "Positif = décharge, négatif = charge."
+          selector:
+            entity:
+              domain: sensor
+        grid_ct_power_entity:
+          name: "External CT1 Power (W)"
+          description: "Positif = consommation réseau, négatif = export. Utilisé comme garde-fou de sûreté supplémentaire (démarrage et extinction)."
+          selector:
+            entity:
+              domain: sensor
+        grid_status_entity:
+          name: "Statut Grid"
+          description: "binary_sensor indiquant l'état du Grid."
+          default: "binary_sensor.bureau_deyes_grid"
+          selector:
+            entity: {}
+        grid_status_ok_value:
+          name: "Valeur attendue si Grid OK"
+          description: "État de l'entité ci-dessus considéré comme 'Grid connecté' (généralement 'on' pour un binary_sensor)."
+          default: "on"
+          selector:
+            text: {}
+        pv_power_entity:
+          name: "PV Power (W)"
+          selector:
+            entity:
+              domain: sensor
+        today_production_entity:
+          name: "Today production (kWh)"
+          selector:
+            entity:
+              domain: sensor
+        load_power_entity:
+          name: "Load power (W)"
+          selector:
+            entity:
+              domain: sensor
+
+    solcast_group:
+      name: "Prévisions Solcast"
+      icon: mdi:weather-sunny
+      input:
+        solcast_power_now_entity:
+          name: "Solcast - Puissance maintenant (W)"
+          selector:
+            entity:
+              domain: sensor
+        solcast_forecast_today_entity:
+          name: "Solcast - Prévision aujourd'hui (kWh)"
+          selector:
+            entity:
+              domain: sensor
+
+    thresholds_group:
+      name: "Seuils"
+      icon: mdi:tune
+      input:
+        soc_start_threshold:
+          name: "Seuil de déclenchement SOC (%)"
+          default: 80
+          selector:
+            number:
+              min: 0
+              max: 100
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+        soc_stop_threshold:
+          name: "Seuil absolu d'arrêt SOC (%)"
+          default: 65
+          selector:
+            number:
+              min: 0
+              max: 100
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+        battery_discharge_stop_threshold_w:
+          name: "Hystérésis décharge batterie (condition 2.a) (W)"
+          description: "La condition 2.a (batterie en décharge) ne se déclenche que si la puissance de décharge dépasse ce seuil, pour éviter les faux positifs sur de petites variations."
+          default: 50
+          selector:
+            number:
+              min: 0
+              max: 2000
+              step: 5
+              unit_of_measurement: "W"
+        grid_import_stop_threshold_w:
+          name: "Seuil d'import réseau (garde-fou CT1) (W)"
+          description: "Utilisé (a) pour interdire le démarrage d'un device si le CT1 indique déjà un import réseau supérieur à ce seuil, et (b) comme condition globale d'extinction supplémentaire (2.e) si l'import dépasse ce seuil, indépendamment du SOC/batterie."
+          default: 50
+          selector:
+            number:
+              min: 0
+              max: 2000
+              step: 5
+              unit_of_measurement: "W"
+        battery_discharge_share_threshold:
+          name: "Seuil part de décharge batterie (condition 2.c) (%)"
+          description: "Un device s'arrête si sa conso dépasse ce % de la puissance de décharge batterie."
+          default: 10
+          selector:
+            number:
+              min: 1
+              max: 100
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+        solcast_completion_threshold:
+          name: "Seuil de rapprochement prévision Solcast (condition 2.d) (%)"
+          default: 95
+          selector:
+            number:
+              min: 1
+              max: 100
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+
+    device_1_group:
+      name: "Device 1 (priorité 1 - la plus haute)"
+      icon: mdi:numeric-1-circle
+      input:
+        device_1_switch:
+          name: "Switch"
+          selector:
+            entity:
+              domain: switch
+        device_1_power:
+          name: "Puissance nominale (W)"
+          default: 1000
+          selector:
+            number:
+              min: 0
+              max: 20000
+              step: 10
+              unit_of_measurement: "W"
+        device_1_power_sensor:
+          name: "Capteur de puissance (optionnel)"
+          description: "Si absent, la puissance nominale est utilisée."
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+        device_1_min_runtime:
+          name: "Temps minimal d'exécution (min)"
+          description: "0 = device autogéré, jamais éteint automatiquement (sauf perte Grid)."
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 600
+              step: 1
+              unit_of_measurement: "min"
+
+    device_2_group:
+      name: "Device 2 (priorité 2)"
+      icon: mdi:numeric-2-circle
+      input:
+        device_2_switch:
+          name: "Switch"
+          selector:
+            entity:
+              domain: switch
+        device_2_power:
+          name: "Puissance nominale (W)"
+          default: 1000
+          selector:
+            number:
+              min: 0
+              max: 20000
+              step: 10
+              unit_of_measurement: "W"
+        device_2_power_sensor:
+          name: "Capteur de puissance (optionnel)"
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+        device_2_min_runtime:
+          name: "Temps minimal d'exécution (min)"
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 600
+              step: 1
+              unit_of_measurement: "min"
+
+    device_3_group:
+      name: "Device 3 (priorité 3)"
+      icon: mdi:numeric-3-circle
+      input:
+        device_3_switch:
+          name: "Switch"
+          selector:
+            entity:
+              domain: switch
+        device_3_power:
+          name: "Puissance nominale (W)"
+          default: 1000
+          selector:
+            number:
+              min: 0
+              max: 20000
+              step: 10
+              unit_of_measurement: "W"
+        device_3_power_sensor:
+          name: "Capteur de puissance (optionnel)"
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+        device_3_min_runtime:
+          name: "Temps minimal d'exécution (min)"
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 600
+              step: 1
+              unit_of_measurement: "min"
+
+    device_4_group:
+      name: "Device 4 (priorité 4 - la plus basse)"
+      icon: mdi:numeric-4-circle
+      input:
+        device_4_switch:
+          name: "Switch"
+          selector:
+            entity:
+              domain: switch
+        device_4_power:
+          name: "Puissance nominale (W)"
+          default: 1000
+          selector:
+            number:
+              min: 0
+              max: 20000
+              step: 10
+              unit_of_measurement: "W"
+        device_4_power_sensor:
+          name: "Capteur de puissance (optionnel)"
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+        device_4_min_runtime:
+          name: "Temps minimal d'exécution (min)"
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 600
+              step: 1
+              unit_of_measurement: "min"
+
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: time_pattern
+    minutes: "/1"
+    id: "tick"
+  - platform: state
+    entity_id: !input grid_status_entity
+    id: "grid_change"
+  - platform: state
+    entity_id: !input battery_soc_entity
+    id: "soc_change"
+  - platform: state
+    entity_id: !input pv_power_entity
+    id: "pv_change"
+  - platform: state
+    entity_id: !input load_power_entity
+    id: "load_change"
+
+condition: []
+
+action:
+  - variables:
+      # --- entrées brutes ---
+      battery_soc_entity: !input battery_soc_entity
+      battery_power_entity: !input battery_power_entity
+      grid_ct_power_entity: !input grid_ct_power_entity
+      grid_status_entity: !input grid_status_entity
+      grid_status_ok_value: !input grid_status_ok_value
+      pv_power_entity: !input pv_power_entity
+      today_production_entity: !input today_production_entity
+      load_power_entity: !input load_power_entity
+      solcast_power_now_entity: !input solcast_power_now_entity
+      solcast_forecast_today_entity: !input solcast_forecast_today_entity
+      soc_start_threshold: !input soc_start_threshold
+      soc_stop_threshold: !input soc_stop_threshold
+      battery_discharge_stop_threshold_w: !input battery_discharge_stop_threshold_w
+      grid_import_stop_threshold_w: !input grid_import_stop_threshold_w
+      battery_discharge_share_threshold: !input battery_discharge_share_threshold
+      solcast_completion_threshold: !input solcast_completion_threshold
+      device_1_switch: !input device_1_switch
+      device_1_power: !input device_1_power
+      device_1_power_sensor: !input device_1_power_sensor
+      device_1_min_runtime: !input device_1_min_runtime
+      device_2_switch: !input device_2_switch
+      device_2_power: !input device_2_power
+      device_2_power_sensor: !input device_2_power_sensor
+      device_2_min_runtime: !input device_2_min_runtime
+      device_3_switch: !input device_3_switch
+      device_3_power: !input device_3_power
+      device_3_power_sensor: !input device_3_power_sensor
+      device_3_min_runtime: !input device_3_min_runtime
+      device_4_switch: !input device_4_switch
+      device_4_power: !input device_4_power
+      device_4_power_sensor: !input device_4_power_sensor
+      device_4_min_runtime: !input device_4_min_runtime
+
+      # --- valeurs live ---
+      battery_soc: "{{ states(battery_soc_entity) | float(0) }}"
+      battery_power: "{{ states(battery_power_entity) | float(0) }}"
+      grid_ct_power: "{{ states(grid_ct_power_entity) | float(0) }}"
+      grid_ok: "{{ states(grid_status_entity) == grid_status_ok_value }}"
+      pv_power: "{{ states(pv_power_entity) | float(0) }}"
+      today_production: "{{ states(today_production_entity) | float(0) }}"
+      load_power: "{{ states(load_power_entity) | float(0) }}"
+      solcast_power_now: "{{ states(solcast_power_now_entity) | float(0) }}"
+      solcast_forecast_today: "{{ states(solcast_forecast_today_entity) | float(0) }}"
+
+      # PV effectif = min(PV réel, Solcast instantané) pour éviter les faux départs sur pic transitoire
+      effective_pv_power: >-
+        {% if solcast_power_now_entity and states(solcast_power_now_entity) not in ['unknown','unavailable',none] %}
+          {{ [pv_power, solcast_power_now] | min }}
+        {% else %}
+          {{ pv_power }}
+        {% endif %}
+
+      surplus_power: "{{ effective_pv_power - load_power }}"
+
+      # --- détection "fin de journée solaire" (2.d), avec garde anti sous-estimation Solcast ---
+      solcast_ratio: >-
+        {% if solcast_forecast_today > 0 %}
+          {{ (today_production / solcast_forecast_today) * 100 }}
+        {% else %}
+          0
+        {% endif %}
+      solcast_completion_reached: >-
+        {{ solcast_forecast_today > 0
+           and today_production < solcast_forecast_today
+           and solcast_ratio >= solcast_completion_threshold }}
+
+      # --- garde-fou CT1 : import réseau significatif => plus de surplus réel, on coupe (2.e) ---
+      grid_importing_unsafe: "{{ grid_ct_power > grid_import_stop_threshold_w }}"
+
+      # --- condition d'extinction globale (2.a batterie en décharge avec hystérésis / 2.b SOC bas / 2.d fin de journée / 2.e import CT1) ---
+      global_stop_condition: >-
+        {{ (battery_power > battery_discharge_stop_threshold_w)
+           or (battery_soc < soc_stop_threshold)
+           or solcast_completion_reached
+           or grid_importing_unsafe }}
+
+      # --- device 1 ---
+      device_1_power_estimate: >-
+        {% if device_1_power_sensor and states(device_1_power_sensor) not in ['unknown','unavailable',none] %}
+          {{ states(device_1_power_sensor) | float(device_1_power) }}
+        {% else %}
+          {{ device_1_power }}
+        {% endif %}
+      device_1_elapsed_min: >-
+        {% set st = states[device_1_switch] %}
+        {{ ((now() - st.last_changed).total_seconds() / 60) if st else 0 }}
+      device_1_self_managed: "{{ device_1_min_runtime | int(0) == 0 }}"
+      device_1_min_runtime_elapsed: "{{ device_1_elapsed_min >= device_1_min_runtime }}"
+      device_1_battery_share_exceeded: >-
+        {{ (battery_power > 0) and (device_1_power_estimate >= (battery_power * (battery_discharge_share_threshold / 100))) }}
+      device_1_should_stop: >-
+        {{ (not grid_ok) or (not device_1_self_managed and device_1_min_runtime_elapsed
+           and (global_stop_condition or device_1_battery_share_exceeded)) }}
+      device_1_can_start: >-
+        {{ states(device_1_switch) == 'off' and grid_ok
+           and battery_soc >= soc_start_threshold
+           and surplus_power >= device_1_power
+           and grid_ct_power <= grid_import_stop_threshold_w }}
+
+      # --- device 2 ---
+      device_2_power_estimate: >-
+        {% if device_2_power_sensor and states(device_2_power_sensor) not in ['unknown','unavailable',none] %}
+          {{ states(device_2_power_sensor) | float(device_2_power) }}
+        {% else %}
+          {{ device_2_power }}
+        {% endif %}
+      device_2_elapsed_min: >-
+        {% set st = states[device_2_switch] %}
+        {{ ((now() - st.last_changed).total_seconds() / 60) if st else 0 }}
+      device_2_self_managed: "{{ device_2_min_runtime | int(0) == 0 }}"
+      device_2_min_runtime_elapsed: "{{ device_2_elapsed_min >= device_2_min_runtime }}"
+      device_2_battery_share_exceeded: >-
+        {{ (battery_power > 0) and (device_2_power_estimate >= (battery_power * (battery_discharge_share_threshold / 100))) }}
+      device_2_should_stop: >-
+        {{ (not grid_ok) or (not device_2_self_managed and device_2_min_runtime_elapsed
+           and (global_stop_condition or device_2_battery_share_exceeded)) }}
+      device_2_can_start: >-
+        {{ states(device_2_switch) == 'off' and grid_ok
+           and battery_soc >= soc_start_threshold
+           and surplus_power >= device_2_power
+           and grid_ct_power <= grid_import_stop_threshold_w }}
+
+      # --- device 3 ---
+      device_3_power_estimate: >-
+        {% if device_3_power_sensor and states(device_3_power_sensor) not in ['unknown','unavailable',none] %}
+          {{ states(device_3_power_sensor) | float(device_3_power) }}
+        {% else %}
+          {{ device_3_power }}
+        {% endif %}
+      device_3_elapsed_min: >-
+        {% set st = states[device_3_switch] %}
+        {{ ((now() - st.last_changed).total_seconds() / 60) if st else 0 }}
+      device_3_self_managed: "{{ device_3_min_runtime | int(0) == 0 }}"
+      device_3_min_runtime_elapsed: "{{ device_3_elapsed_min >= device_3_min_runtime }}"
+      device_3_battery_share_exceeded: >-
+        {{ (battery_power > 0) and (device_3_power_estimate >= (battery_power * (battery_discharge_share_threshold / 100))) }}
+      device_3_should_stop: >-
+        {{ (not grid_ok) or (not device_3_self_managed and device_3_min_runtime_elapsed
+           and (global_stop_condition or device_3_battery_share_exceeded)) }}
+      device_3_can_start: >-
+        {{ states(device_3_switch) == 'off' and grid_ok
+           and battery_soc >= soc_start_threshold
+           and surplus_power >= device_3_power
+           and grid_ct_power <= grid_import_stop_threshold_w }}
+
+      # --- device 4 ---
+      device_4_power_estimate: >-
+        {% if device_4_power_sensor and states(device_4_power_sensor) not in ['unknown','unavailable',none] %}
+          {{ states(device_4_power_sensor) | float(device_4_power) }}
+        {% else %}
+          {{ device_4_power }}
+        {% endif %}
+      device_4_elapsed_min: >-
+        {% set st = states[device_4_switch] %}
+        {{ ((now() - st.last_changed).total_seconds() / 60) if st else 0 }}
+      device_4_self_managed: "{{ device_4_min_runtime | int(0) == 0 }}"
+      device_4_min_runtime_elapsed: "{{ device_4_elapsed_min >= device_4_min_runtime }}"
+      device_4_battery_share_exceeded: >-
+        {{ (battery_power > 0) and (device_4_power_estimate >= (battery_power * (battery_discharge_share_threshold / 100))) }}
+      device_4_should_stop: >-
+        {{ (not grid_ok) or (not device_4_self_managed and device_4_min_runtime_elapsed
+           and (global_stop_condition or device_4_battery_share_exceeded)) }}
+      device_4_can_start: >-
+        {{ states(device_4_switch) == 'off' and grid_ok
+           and battery_soc >= soc_start_threshold
+           and surplus_power >= device_4_power
+           and grid_ct_power <= grid_import_stop_threshold_w }}
+
+  # --- Passe extinction : indépendante par device, peut en couper plusieurs dans le même cycle ---
+  - if:
+      - condition: template
+        value_template: "{{ device_1_should_stop and is_state(device_1_switch, 'on') }}"
+    then:
+      - service: switch.turn_off
+        target:
+          entity_id: "{{ device_1_switch }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ device_2_should_stop and is_state(device_2_switch, 'on') }}"
+    then:
+      - service: switch.turn_off
+        target:
+          entity_id: "{{ device_2_switch }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ device_3_should_stop and is_state(device_3_switch, 'on') }}"
+    then:
+      - service: switch.turn_off
+        target:
+          entity_id: "{{ device_3_switch }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ device_4_should_stop and is_state(device_4_switch, 'on') }}"
+    then:
+      - service: switch.turn_off
+        target:
+          entity_id: "{{ device_4_switch }}"
+
+  # --- Passe démarrage : un seul device par cycle, dans l'ordre de priorité ---
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ device_1_can_start }}"
+        sequence:
+          - service: switch.turn_on
+            target:
+              entity_id: "{{ device_1_switch }}"
+      - conditions:
+          - condition: template
+            value_template: "{{ device_2_can_start }}"
+        sequence:
+          - service: switch.turn_on
+            target:
+              entity_id: "{{ device_2_switch }}"
+      - conditions:
+          - condition: template
+            value_template: "{{ device_3_can_start }}"
+        sequence:
+          - service: switch.turn_on
+            target:
+              entity_id: "{{ device_3_switch }}"
+      - conditions:
+          - condition: template
+            value_template: "{{ device_4_can_start }}"
+        sequence:
+          - service: switch.turn_on
+            target:
+              entity_id: "{{ device_4_switch }}"
+    default: []
