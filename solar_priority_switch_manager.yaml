@@ -1,7 +1,7 @@
 blueprint:
   name: "Solar Priority Switch Manager (Deye/Solarman + Solcast) - Zéro Injection"
   description: >
-    **Version: 1.1**
+    **Version: 1.1.1**
 
 
     Pilote jusqu'à 4 switches par ordre de priorité (1 = prioritaire, 4 = dernier)
@@ -439,8 +439,12 @@ action:
           {{ device_2_power }}
         {% endif %}
       device_2_elapsed_min: >-
-        {% set st = states[device_2_switch] %}
-        {{ ((now() - st.last_changed).total_seconds() / 60) if st else 0 }}
+        {% if device_2_switch %}
+          {% set st = states[device_2_switch] %}
+          {{ ((now() - st.last_changed).total_seconds() / 60) if st else 0 }}
+        {% else %}
+          0
+        {% endif %}
       device_2_self_managed: "{{ device_2_min_runtime | int(0) == 0 }}"
       device_2_min_runtime_elapsed: "{{ device_2_elapsed_min >= device_2_min_runtime }}"
       device_2_battery_share_exceeded: >-
@@ -463,8 +467,12 @@ action:
           {{ device_3_power }}
         {% endif %}
       device_3_elapsed_min: >-
-        {% set st = states[device_3_switch] %}
-        {{ ((now() - st.last_changed).total_seconds() / 60) if st else 0 }}
+        {% if device_3_switch %}
+          {% set st = states[device_3_switch] %}
+          {{ ((now() - st.last_changed).total_seconds() / 60) if st else 0 }}
+        {% else %}
+          0
+        {% endif %}
       device_3_self_managed: "{{ device_3_min_runtime | int(0) == 0 }}"
       device_3_min_runtime_elapsed: "{{ device_3_elapsed_min >= device_3_min_runtime }}"
       device_3_battery_share_exceeded: >-
@@ -487,8 +495,12 @@ action:
           {{ device_4_power }}
         {% endif %}
       device_4_elapsed_min: >-
-        {% set st = states[device_4_switch] %}
-        {{ ((now() - st.last_changed).total_seconds() / 60) if st else 0 }}
+        {% if device_4_switch %}
+          {% set st = states[device_4_switch] %}
+          {{ ((now() - st.last_changed).total_seconds() / 60) if st else 0 }}
+        {% else %}
+          0
+        {% endif %}
       device_4_self_managed: "{{ device_4_min_runtime | int(0) == 0 }}"
       device_4_min_runtime_elapsed: "{{ device_4_elapsed_min >= device_4_min_runtime }}"
       device_4_battery_share_exceeded: >-
